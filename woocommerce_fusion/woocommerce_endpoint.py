@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 from http import HTTPStatus
 
 import frappe
@@ -14,6 +15,8 @@ from woocommerce_fusion.woocommerce.woocommerce_api import (
 	parse_domain_from_url,
 )
 
+WEBHOOK_PING_PATTERN = re.compile(rb"webhook_id=\d+")
+
 
 def validate_request() -> tuple[bool, HTTPStatus | None, str | None]:
 	# Get relevant WooCommerce Server
@@ -23,18 +26,23 @@ def validate_request() -> tuple[bool, HTTPStatus | None, str | None]:
 	except Exception:
 		return False, HTTPStatus.BAD_REQUEST, _("Missing Header")
 
-	# Validate secret
-	_sig = base64.b64encode(
-		hmac.new(wc_server.secret.encode("utf8"), frappe.request.data, hashlib.sha256).digest()
-	)
-	# if (
-	# 	frappe.request.data
-	# 	and not sig == frappe.get_request_header("x-wc-webhook-signature", "").encode()
-	# ):
-	# 	return False, HTTPStatus.UNAUTHORIZED, _("Unauthorized")
+	signature = frappe.get_request_header("x-wc-webhook-signature", "")
+	if not is_valid_signature(wc_server.secret, frappe.request.data, signature):
+		return False, HTTPStatus.UNAUTHORIZED, _("Unauthorized")
 
 	frappe.set_user(wc_server.creation_user)  # nosemgrep
 	return True, None, None
+
+
+def is_valid_signature(secret: str | None, payload: bytes, signature: str) -> bool:
+	if not secret or not payload:
+		return False
+	expected = base64.b64encode(hmac.new(secret.encode("utf8"), payload, hashlib.sha256).digest())
+	return hmac.compare_digest(expected, signature.encode("utf8"))
+
+
+def is_ping(payload: bytes) -> bool:
+	return WEBHOOK_PING_PATTERN.fullmatch(payload) is not None
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
@@ -42,6 +50,11 @@ def order_created(*args, **kwargs):
 	"""
 	Accepts payload data from WooCommerce "Order Created" webhook
 	"""
+	# WooCommerce pings new webhooks without a signature or source header. Answering does
+	# nothing, so it needs no authentication and must not reach validate_request.
+	if frappe.request and is_ping(frappe.request.data):
+		return Response(status=HTTPStatus.OK)
+
 	valid, status, msg = validate_request()
 	if not valid:
 		return Response(response=msg, status=status)
